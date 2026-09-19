@@ -178,6 +178,211 @@ def test_rdate_in_fold_returns_two_occurrences(api):
     assert [o["fold"] for o in rdates] == [0, 1]
 
 
+# ------------------------------------------------------------- dst_policy --
+
+def test_gap_shift_forward_moves_wall_time_past_gap(api):
+    # 02:30 does not exist on 2025-03-09 in New York (jump 02:00 -> 03:00);
+    # shift_forward moves it past the one-hour gap to 03:30.
+    resp = post(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-03-08T02:30:00",
+            "rrule": "FREQ=DAILY;COUNT=3",
+            "dst_policy": {"gap": "shift_forward"},
+            "interval_start": "2025-03-01T00:00:00Z",
+            "interval_end": "2025-03-20T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["utc"], o["utc_offset"], o["dst"]) for o in occ] == [
+        ("2025-03-08T02:30:00", "2025-03-08T07:30:00Z", "-05:00", False),
+        ("2025-03-09T03:30:00", "2025-03-09T07:30:00Z", "-04:00", True),  # shifted
+        ("2025-03-10T02:30:00", "2025-03-10T06:30:00Z", "-04:00", True),
+    ]
+
+
+def test_gap_shift_forward_with_sub_hour_gap(api):
+    # Australia/Lord_Howe springs forward only 30 minutes (02:00 -> 02:30).
+    resp = post(
+        {
+            "timezone": "Australia/Lord_Howe",
+            "start_local": "2025-10-05T02:15:00",
+            "dst_policy": {"gap": "shift_forward"},
+            "interval_start": "2025-10-04T00:00:00Z",
+            "interval_end": "2025-10-06T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    (o,) = resp.json()["occurrences"]
+    assert o["local"] == "2025-10-05T02:45:00"  # 02:15 + 30-minute gap
+    assert o["utc"] == "2025-10-04T15:45:00Z"
+    assert o["utc_offset"] == "+11:00"
+    assert o["dst"] is True
+
+
+def test_gap_default_still_skips_when_policy_present(api):
+    resp = post(
+        {
+            "timezone": "Australia/Lord_Howe",
+            "start_local": "2025-10-05T02:15:00",
+            "dst_policy": {"fold": "earlier"},  # gap defaults to 'skip'
+            "interval_start": "2025-10-04T00:00:00Z",
+            "interval_end": "2025-10-06T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+
+
+def test_gap_shift_forward_applies_to_rdate(api):
+    resp = post(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-03-07T12:00:00",  # outside the query window
+            "rdate": ["2025-03-09T02:30:00"],
+            "dst_policy": {"gap": "shift_forward"},
+            "interval_start": "2025-03-08T00:00:00Z",
+            "interval_end": "2025-03-10T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["utc"], o["source"]) for o in occ] == [
+        ("2025-03-09T03:30:00", "2025-03-09T07:30:00Z", "rdate"),
+    ]
+
+
+def test_fold_earlier_and_later_select_single_pass(api):
+    base = {
+        "timezone": "America/New_York",
+        "start_local": "2025-11-02T01:30:00",
+        "interval_start": "2025-11-02T00:00:00Z",
+        "interval_end": "2025-11-03T00:00:00Z",
+    }
+    resp = post({**base, "dst_policy": {"fold": "earlier"}})
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["utc"], o["utc_offset"], o["fold"], o["dst"]) for o in occ] == [
+        ("2025-11-02T05:30:00Z", "-04:00", 0, True),
+    ]
+
+    resp = post({**base, "dst_policy": {"fold": "later"}})
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["utc"], o["utc_offset"], o["fold"], o["dst"]) for o in occ] == [
+        ("2025-11-02T06:30:00Z", "-05:00", 1, False),
+    ]
+
+
+def test_fold_policy_applies_to_rdate(api):
+    resp = post(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-11-02T00:00:00",
+            "rdate": ["2025-11-02T01:45:00"],
+            "dst_policy": {"fold": "later"},
+            "interval_start": "2025-11-02T00:00:00Z",
+            "interval_end": "2025-11-03T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    rdates = [o for o in resp.json()["occurrences"] if o["source"] == "rdate"]
+    assert [(o["utc"], o["utc_offset"], o["fold"]) for o in rdates] == [
+        ("2025-11-02T06:45:00Z", "-05:00", 1),
+    ]
+
+
+def test_fold_policy_keeps_unambiguous_wall_times(api):
+    # A wall time that occurs only once is kept regardless of the fold side.
+    resp = post(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-11-02T09:30:00",
+            "dst_policy": {"fold": "later"},
+            "interval_start": "2025-11-02T00:00:00Z",
+            "interval_end": "2025-11-03T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 1
+
+
+def test_exdate_matches_original_wall_time_even_when_shifted(api):
+    base = {
+        "timezone": "America/New_York",
+        "start_local": "2025-03-09T02:30:00",
+        "dst_policy": {"gap": "shift_forward"},
+        "interval_start": "2025-03-01T00:00:00Z",
+        "interval_end": "2025-03-20T00:00:00Z",
+    }
+    # Excluding the *original* wall time removes the shifted occurrence.
+    resp = post({**base, "exdate": ["2025-03-09T02:30:00"]})
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+    # Excluding the *shifted* wall time does not match anything.
+    resp = post({**base, "exdate": ["2025-03-09T03:30:00"]})
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 1
+
+
+def test_shifted_rdate_colliding_with_rrule_keeps_rrule(api):
+    # RDATE 02:30 shifts onto 03:30 EDT (07:30Z), where DTSTART already sits.
+    resp = post(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-03-09T03:30:00",
+            "rdate": ["2025-03-09T02:30:00"],
+            "dst_policy": {"gap": "shift_forward"},
+            "interval_start": "2025-03-09T00:00:00Z",
+            "interval_end": "2025-03-10T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["utc"], o["source"]) for o in occ] == [
+        ("2025-03-09T03:30:00", "2025-03-09T07:30:00Z", "rrule"),
+    ]
+
+
+def test_shifted_rrule_instance_wins_over_rdate(api):
+    # DTSTART 02:30 shifts onto 03:30 EDT (07:30Z), colliding with the RDATE.
+    resp = post(
+        {
+            "timezone": "America/New_York",
+            "start_local": "2025-03-09T02:30:00",
+            "rdate": ["2025-03-09T03:30:00"],
+            "dst_policy": {"gap": "shift_forward"},
+            "interval_start": "2025-03-09T00:00:00Z",
+            "interval_end": "2025-03-10T00:00:00Z",
+        }
+    )
+    assert resp.status_code == 200
+    occ = resp.json()["occurrences"]
+    assert [(o["local"], o["utc"], o["source"]) for o in occ] == [
+        ("2025-03-09T03:30:00", "2025-03-09T07:30:00Z", "rrule"),
+    ]
+
+
+def test_invalid_dst_policy_values_are_validation_error(api):
+    base = {
+        "timezone": "UTC",
+        "start_local": "2025-01-01T00:00:00",
+        "interval_start": "2025-01-01T00:00:00Z",
+        "interval_end": "2025-02-01T00:00:00Z",
+    }
+    for policy in (
+        {"gap": "drop"},
+        {"fold": "first"},
+        {"gap": "skip", "fold": "yesterday"},
+        "shift_forward",
+        42,
+    ):
+        resp = post({**base, "dst_policy": policy})
+        assert resp.status_code == 422, policy
+        assert resp.json()["error"]["code"] == "validation_error"
+
+
 # --------------------------------------------------------- EXDATE / RDATE --
 
 def test_exdate_removes_and_rdate_adds(api):

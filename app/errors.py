@@ -55,3 +55,12 @@ def invalid_datetime(field: str, value: Any, reason: str) -> APIError:
         message=f"Invalid datetime for field {field!r}: {reason}",
         details=[{"field": field, "value": value, "reason": reason}],
     )
+
+
+def invalid_dst_policy(message: str) -> APIError:
+    """Bad ``dst_policy`` value; rendered as the unified 422 validation error."""
+    return APIError(
+        code="validation_error",
+        message=f"Invalid dst_policy: {message}",
+        status_code=422,
+    )

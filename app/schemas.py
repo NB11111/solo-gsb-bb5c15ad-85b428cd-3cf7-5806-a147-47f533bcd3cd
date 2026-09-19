@@ -7,6 +7,28 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class DstPolicy(BaseModel):
+    """How to resolve local wall times that hit a DST transition."""
+
+    gap: Literal["skip", "shift_forward"] = Field(
+        default="skip",
+        description=(
+            "Policy for a local wall time that does not exist (spring-forward gap): "
+            "'skip' drops the occurrence; 'shift_forward' moves it forward past the "
+            "gap by the size of the offset jump (e.g. 02:30 becomes 03:30 in a "
+            "one-hour jump)."
+        ),
+    )
+    fold: Literal["both", "earlier", "later"] = Field(
+        default="both",
+        description=(
+            "Policy for a local wall time that occurs twice (fall-back fold): "
+            "'both' returns one occurrence per pass; 'earlier' keeps only the first "
+            "pass (fold=0); 'later' keeps only the second pass (fold=1)."
+        ),
+    )
+
+
 class OccurrenceRequest(BaseModel):
     """Body of ``POST /occurrences``.
 
@@ -57,6 +79,14 @@ class OccurrenceRequest(BaseModel):
     rdate: list[str] = Field(
         default_factory=list,
         description="Additional local wall times to add (RFC 5545 RDATE semantics).",
+    )
+    dst_policy: DstPolicy | None = Field(
+        default=None,
+        description=(
+            "Optional DST resolution policy applied to DTSTART, RRULE and RDATE "
+            "(EXDATE always matches the original local wall time). "
+            "Defaults to {'gap': 'skip', 'fold': 'both'}."
+        ),
     )
 
 

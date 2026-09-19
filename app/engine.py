@@ -2,19 +2,27 @@
 
 The expansion works entirely with *naive local wall times* in the requested
 IANA zone (which is how ``dateutil.rrule`` generates instances) and converts
-to real instants only at the boundary, where DST gaps and folds are resolved:
+to real instants only at the boundary, where DST gaps and folds are resolved
+according to the optional ``dst_policy`` request field:
 
-* a wall time that does not exist (spring-forward gap) is skipped;
+* a wall time that does not exist (spring-forward gap) is skipped
+  (``gap='skip'``, the default) or moved forward past the gap by the size of
+  the offset jump (``gap='shift_forward'``, e.g. 02:30 -> 03:30 in a one-hour
+  jump);
 * a wall time that happens twice (fall-back fold) yields two occurrences,
-  ``fold=0`` (offset before the transition) and ``fold=1`` (offset after).
+  ``fold=0`` (offset before the transition) and ``fold=1`` (offset after),
+  unless ``fold='earlier'``/``'later'`` keeps only one pass.
 
-EXDATE matches local wall time per RFC 5545; the UTC instants produced by the
-RRULE always take precedence over RDATE for the same instant.
+The policy applies to DTSTART, RRULE and RDATE. EXDATE matches the *original*
+local wall time per RFC 5545 (even when the occurrence was shifted), and the
+UTC instants produced by the RRULE always take precedence over RDATE for the
+same instant, including collisions created by a gap shift.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone, tzinfo
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil.parser.isoparser import isoparser
@@ -23,6 +31,7 @@ from dateutil.rrule import rrulestr
 from .errors import (
     APIError,
     invalid_datetime,
+    invalid_dst_policy,
     invalid_interval,
     invalid_rrule,
     invalid_timezone,
@@ -37,6 +46,29 @@ _WINDOW_MARGIN = timedelta(days=2)
 
 # Guard against pathological rules (e.g. FREQ=SECONDLY over a huge range).
 DEFAULT_MAX_OCCURRENCES = 10_000
+
+# Valid dst_policy values; the defaults preserve the historical behaviour.
+_GAP_POLICIES = ("skip", "shift_forward")
+_FOLD_POLICIES = ("both", "earlier", "later")
+
+
+def parse_dst_policy(raw: Any) -> tuple[str, str]:
+    """Validate the optional ``dst_policy`` mapping; defaults are skip/both.
+
+    The API schema already constrains the values, so this mainly protects
+    direct engine callers; it raises the same unified ``validation_error``.
+    """
+    if raw is None:
+        return "skip", "both"
+    if not isinstance(raw, dict):
+        raise invalid_dst_policy("expected an object like {'gap': 'skip', 'fold': 'both'}")
+    gap = raw.get("gap", "skip")
+    fold = raw.get("fold", "both")
+    if gap not in _GAP_POLICIES:
+        raise invalid_dst_policy(f"'gap' must be one of {list(_GAP_POLICIES)}")
+    if fold not in _FOLD_POLICIES:
+        raise invalid_dst_policy(f"'fold' must be one of {list(_FOLD_POLICIES)}")
+    return gap, fold
 
 
 def get_zone(tz_name: str) -> ZoneInfo:
@@ -196,8 +228,11 @@ def localize_naive(naive: datetime, zone: tzinfo) -> list[tuple[datetime, int]]:
     Returns ``[(aware_datetime, fold), ...]``:
 
     * ``[]`` for a non-existent time (spring-forward gap);
-    * ``[(dt, 0)]`` for a normal time, or the earlier pass of a fold;
-    * ``[(dt, 0), (dt, 1)]`` for a repeated wall time (fall-back fold).
+    * two entries otherwise: for a repeated wall time (fall-back fold) they
+      are the two distinct instants, ``fold=0`` (offset before the transition)
+      and ``fold=1`` (offset after); for a normal time both fold values
+      resolve to the *same* instant, which therefore appears twice (dedupe
+      with ``_distinct_instants`` when that matters).
 
     Note: ``aware.replace(tzinfo=None)`` merely strips the tzinfo rather than
     normalizing through the offset, so gap/fold detection is done by building
@@ -216,6 +251,67 @@ def localize_naive(naive: datetime, zone: tzinfo) -> list[tuple[datetime, int]]:
             continue
         results.append((back, back.fold))
     return results
+
+
+def _gap_width(naive: datetime, zone: tzinfo) -> timedelta:
+    """Width of the offset jump at a non-existent wall time.
+
+    Per PEP 495, for a gap ``fold=0`` resolves with the offset in effect
+    before the transition and ``fold=1`` with the one after it, so the
+    difference is the size of the jump (positive for real IANA gaps).
+    """
+    before = naive.replace(tzinfo=zone, fold=0).utcoffset() or timedelta(0)
+    after = naive.replace(tzinfo=zone, fold=1).utcoffset() or timedelta(0)
+    return after - before
+
+
+def _distinct_instants(candidates: list[tuple[datetime, int]]) -> list[tuple[datetime, int]]:
+    """Drop duplicate UTC instants, keeping the earliest fold.
+
+    ``localize_naive`` tries both fold values, so a wall time that occurs only
+    once comes back as the same instant twice; a genuinely repeated wall time
+    (fall-back fold) comes back as two distinct instants.
+    """
+    seen: set[datetime] = set()
+    unique: list[tuple[datetime, int]] = []
+    for aware, fold in candidates:
+        instant = aware.astimezone(timezone.utc)
+        if instant in seen:
+            continue
+        seen.add(instant)
+        unique.append((aware, fold))
+    return unique
+
+
+def resolve_wall(
+    naive: datetime,
+    zone: tzinfo,
+    *,
+    gap: str = "skip",
+    fold: str = "both",
+) -> list[tuple[datetime, datetime, int]]:
+    """Resolve a naive wall time to ``[(local_wall, aware, fold), ...]``.
+
+    ``local_wall`` is the wall time that actually occurs: it equals ``naive``
+    unless ``gap='shift_forward'`` pushed a non-existent time forward past the
+    gap (e.g. 02:30 -> 03:30 in a one-hour spring-forward). ``fold`` selects
+    which pass of a repeated wall time to keep; a wall time that occurs only
+    once is always kept.
+    """
+    wall = naive
+    candidates = _distinct_instants(localize_naive(wall, zone))
+    if not candidates:
+        if gap != "shift_forward":
+            return []
+        width = _gap_width(naive, zone)
+        if width <= timedelta(0):
+            return []
+        wall = naive + width
+        candidates = _distinct_instants(localize_naive(wall, zone))
+    if fold != "both" and len(candidates) > 1:
+        wanted = 0 if fold == "earlier" else 1
+        candidates = [(aware, f) for aware, f in candidates if f == wanted]
+    return [(wall, aware, f) for aware, f in candidates]
 
 
 def _format_offset(delta: timedelta) -> str:
@@ -256,6 +352,8 @@ def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRE
 
     dtstart = parse_local_wall(payload["start_local"], "start_local", zone)
 
+    gap_policy, fold_policy = parse_dst_policy(payload.get("dst_policy"))
+
     exdates = {
         parse_local_wall(v, "exdate", zone)
         for v in payload.get("exdate") or []
@@ -271,24 +369,30 @@ def expand_occurrences(payload: dict, max_occurrences: int = DEFAULT_MAX_OCCURRE
     lo_wall = lo_utc.astimezone(zone).replace(tzinfo=None) - _WINDOW_MARGIN
     hi_wall = hi_utc.astimezone(zone).replace(tzinfo=None) + _WINDOW_MARGIN
 
-    # Collect instants keyed by UTC time. RRULE wins over RDATE on collision.
-    # Value: (naive_wall, aware_datetime, fold, source)
+    # Collect instants keyed by UTC time. RRULE wins over RDATE on collision,
+    # including collisions created when a gap shift moves an instance onto an
+    # existing instant.
+    # Value: (local_wall, aware_datetime, fold, source)
     chosen: dict[datetime, tuple[datetime, datetime, int, str]] = {}
 
     def add(naive_local: datetime, source: str) -> None:
+        # EXDATE matches the *original* requested wall time (RFC 5545), even
+        # when the gap policy shifts the occurrence to a later wall time.
         if naive_local in exdates:
             return
         if not (lo_wall <= naive_local <= hi_wall):
             return
-        for aware, fold in localize_naive(naive_local, zone):
+        for local_wall, aware, fold in resolve_wall(
+            naive_local, zone, gap=gap_policy, fold=fold_policy
+        ):
             instant = aware.astimezone(timezone.utc)
             if not (lo_utc <= instant < hi_utc):
                 continue
             if instant in chosen:
                 if source == "rrule":
-                    chosen[instant] = (naive_local, aware, fold, source)
+                    chosen[instant] = (local_wall, aware, fold, source)
                 continue
-            chosen[instant] = (naive_local, aware, fold, source)
+            chosen[instant] = (local_wall, aware, fold, source)
 
     raw_rule = payload.get("rrule")
     if raw_rule:

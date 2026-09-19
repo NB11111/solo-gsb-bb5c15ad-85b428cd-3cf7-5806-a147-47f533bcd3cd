@@ -19,7 +19,9 @@ app = FastAPI(
     description=(
         "Expand iCalendar RRULE / RDATE / EXDATE recurrence sets into concrete "
         "occurrences inside a UTC query window, with correct IANA time-zone, "
-        "DST gap and repeated-wall-time (fold) handling."
+        "DST gap and repeated-wall-time (fold) handling. DST resolution is "
+        "configurable per request via `dst_policy`: `gap` = `skip` (default) or "
+        "`shift_forward`; `fold` = `both` (default), `earlier` or `later`."
     ),
     version=__version__,
 )
@@ -74,6 +76,13 @@ async def health() -> HealthResponse:
     response_model=OccurrenceResponse,
     tags=["occurrences"],
     summary="Expand a recurrence rule into instances within a query interval",
+    description=(
+        "Expands DTSTART/RRULE/RDATE into concrete occurrences, minus EXDATE. "
+        "DST handling is configurable via `dst_policy`: `gap` = `skip` (default) "
+        "or `shift_forward` (non-existent wall times move past the gap, e.g. "
+        "02:30 -> 03:30); `fold` = `both` (default), `earlier` or `later` for "
+        "repeated wall times. EXDATE always matches the original local wall time."
+    ),
 )
 async def occurrences(request: OccurrenceRequest) -> OccurrenceResponse:
     result = expand_occurrences(request.model_dump(), max_occurrences=_max_occurrences())

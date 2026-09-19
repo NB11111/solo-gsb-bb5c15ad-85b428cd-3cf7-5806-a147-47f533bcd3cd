@@ -5,9 +5,13 @@
 
 - 使用 **IANA 时区**（如 `Asia/Shanghai`、`America/New_York`）计算本地时间
 - 返回结果按 **UTC 时刻升序**排列，同时保留**本地墙钟时间**与 **UTC 偏移**
-- 正确处理夏令时：
-  - 本地不存在的时刻（春季跳时 gap）**自动跳过**
-  - 本地重复的时刻（秋季回拨 fold）**返回两条**，分别带 `fold: 0/1` 与对应偏移
+- 正确处理夏令时，并可通过可选的 `dst_policy` 选择策略：
+  - 本地不存在的时刻（春季跳时 gap）默认**自动跳过**（`gap: "skip"`），
+    也可顺延（`gap: "shift_forward"`，如 `02:30` 在一小时跳时后落到 `03:30`）
+  - 本地重复的时刻（秋季回拨 fold）默认**返回两条**（`fold: "both"`），
+    分别带 `fold: 0/1` 与对应偏移；也可只保留较早（`"earlier"`）或较晚（`"later"`）一侧
+  - 策略对 DTSTART、RRULE、RDATE 生效；EXDATE 始终按**原始本地墙钟时间**排除
+  - 顺延后的实例与其他实例落到同一 UTC 时刻时，沿用 **RRULE 优先**去重
 - 支持月末规则（`BYMONTHDAY=-1`）、带索引星期（`BYDAY=-1FR`）、`COUNT`/`UNTIL`、
   排除日期（EXDATE）与补充日期（RDATE）
 - 无效时区、无效规则、无效区间返回**结构化 JSON 错误**
@@ -64,6 +68,7 @@ docker compose up --build -d
 | `interval_end` | 是 | 查询区间终点（**不含**），必须带 UTC 偏移 |
 | `exdate` | 否 | 要排除的本地墙钟时间列表 |
 | `rdate` | 否 | 要补充的本地墙钟时间列表 |
+| `dst_policy` | 否 | DST 策略对象 `{"gap": ..., "fold": ...}`，缺省为 `{"gap": "skip", "fold": "both"}`（保持默认行为）。`gap`：`skip` 跳过春季跳时间隙中不存在的墙钟时间，`shift_forward` 按时区跃迁缺口顺延（如 `02:30` → `03:30`）；`fold`：重复墙钟时间保留 `both` 两侧、`earlier` 较早侧（fold=0）或 `later` 较晚侧（fold=1）。策略应用于 DTSTART、RRULE 与 RDATE，EXDATE 始终按原始墙钟时间匹配 |
 
 返回的每个实例：
 
@@ -122,6 +127,39 @@ curl -s -X POST http://localhost:8000/occurrences \
 
 返回 3 月 8 日与 3 月 10 日两条（3 月 9 日跳过）。
 
+### 不存在的本地时刻顺延（`gap: "shift_forward"`）
+
+把上面的请求加上 `dst_policy`，3 月 9 日不存在的 `02:30` 顺延一小时到 `03:30`（EDT），
+返回的 `local` 为顺延后的真实墙钟时间，`utc_offset` / `dst` / `utc` 均为顺延后时刻的值：
+
+```bash
+curl -s -X POST http://localhost:8000/occurrences \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timezone": "America/New_York",
+    "start_local": "2025-03-08T02:30:00",
+    "rrule": "FREQ=DAILY;COUNT=3",
+    "interval_start": "2025-03-01T00:00:00Z",
+    "interval_end": "2025-03-20T00:00:00Z",
+    "dst_policy": {"gap": "shift_forward"}
+  }'
+```
+
+```json
+{
+  "timezone": "America/New_York",
+  "count": 3,
+  "occurrences": [
+    {"local": "2025-03-08T02:30:00", "utc": "2025-03-08T07:30:00Z", "utc_offset": "-05:00", "dst": false, "fold": 0, "source": "rrule"},
+    {"local": "2025-03-09T03:30:00", "utc": "2025-03-09T07:30:00Z", "utc_offset": "-04:00", "dst": true,  "fold": 0, "source": "rrule"},
+    {"local": "2025-03-10T02:30:00", "utc": "2025-03-10T06:30:00Z", "utc_offset": "-04:00", "dst": true,  "fold": 0, "source": "rrule"}
+  ]
+}
+```
+
+顺延量等于该时区实际的跃迁时长（通常 1 小时；`Australia/Lord_Howe` 等时区为 30 分钟）。
+若顺延后的 UTC 时刻与另一条 RDATE 相同，仍按 RRULE 优先只返回一条。
+
 ### 重复的本地时刻返回两个 fold
 
 纽约时间 2025-11-02 凌晨 02:00 回拨到 01:00，`01:30` 发生两次：
@@ -148,6 +186,17 @@ curl -s -X POST http://localhost:8000/occurrences \
 }
 ```
 
+只保留一侧时使用 `"fold": "earlier"`（fold=0，EDT 那次）或 `"later"`（fold=1，EST 那次），
+返回的 `fold`、`utc_offset`、`utc` 与所选侧一致；非重复的普通时刻不受 fold 策略影响：
+
+```json
+"dst_policy": {"fold": "later"}
+```
+
+```json
+{"local": "2025-11-02T01:30:00", "utc": "2025-11-02T06:30:00Z", "utc_offset": "-05:00", "dst": false, "fold": 1, "source": "rrule"}
+```
+
 ### EXDATE / RDATE
 
 ```bash
@@ -167,9 +216,14 @@ curl -s -X POST http://localhost:8000/occurrences \
 语义说明：
 
 - EXDATE 按**本地墙钟时间**匹配（RFC 5545），命中即排除，对 RRULE 与 RDATE 都生效；
-  重复墙钟时间的两个 fold 会一并排除
-- 同一 UTC 时刻被规则和 RDATE 同时命中时，**RRULE 优先**，不重复返回
-- RDATE 命中 fold 时同样返回两个实例；命中 gap 时该 RDATE 被跳过
+  重复墙钟时间的两个 fold 会一并排除。即使 `gap: "shift_forward"` 把实例顺延，
+  EXDATE 仍按**未顺延的原始墙钟时间**匹配
+- 同一 UTC 时刻被规则和 RDATE 同时命中时，**RRULE 优先**，不重复返回；
+  `shift_forward` 顺延后与其他实例重合时同样按此去重
+- RDATE 命中 fold 时按 `dst_policy.fold` 返回一个或两个实例；命中 gap 时默认跳过，
+  或按 `shift_forward` 顺延
+- `dst_policy` 可整体省略，或只给其中一个键；非法枚举值（含未知键）返回
+  `422 validation_error`（字段级 details 指向 `dst_policy.*`）
 - 查询区间为半开区间 `[interval_start, interval_end)`
 - `UNTIL` 同时接受 UTC（`...Z`）、显式偏移与目标时区本地时间，
   内部统一换算为目标时区墙钟时间后比较；`COUNT` 与 `UNTIL` 互斥
@@ -185,7 +239,7 @@ curl -s -X POST http://localhost:8000/occurrences \
 | 400 | `invalid_interval` | `interval_start >= interval_end` |
 | 400 | `invalid_datetime` | 时间字段语法错误，或查询区间缺少 UTC 偏移 |
 | 400 | `too_many_occurrences` | 展开实例数/扫描量超过 `APP_MAX_OCCURRENCES` |
-| 422 | `validation_error` | 请求体不是合法 JSON 或缺少必填字段（含字段级 details） |
+| 422 | `validation_error` | 请求体不是合法 JSON、缺少必填字段，或 `dst_policy` 取值非法（含字段级 details） |
 
 ## 项目结构
 

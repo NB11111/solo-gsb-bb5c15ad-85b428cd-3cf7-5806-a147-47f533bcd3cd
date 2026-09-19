@@ -19,7 +19,11 @@ app = FastAPI(
     description=(
         "Expand iCalendar RRULE / RDATE / EXDATE recurrence sets into concrete "
         "occurrences inside a UTC query window, with correct IANA time-zone, "
-        "DST gap and repeated-wall-time (fold) handling."
+        "DST gap and repeated-wall-time (fold) handling. The optional "
+        "dst_policy selects gap handling ('skip', the default, or "
+        "'shift_forward') and which fold side to keep ('both', the default, "
+        "'earlier' or 'later'); EXDATE always matches the original local "
+        "wall time."
     ),
     version=__version__,
 )

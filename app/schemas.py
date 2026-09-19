@@ -4,7 +4,34 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class DstPolicy(BaseModel):
+    """How to resolve local wall times that DST renders non-existent or repeated.
+
+    Applied to DTSTART, RRULE instances and RDATE. EXDATE always matches the
+    original, unshifted local wall time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    gap: Literal["skip", "shift_forward"] = Field(
+        default="skip",
+        description=(
+            "'skip' drops a wall time that does not exist in a spring-forward "
+            "gap; 'shift_forward' moves it past the gap by the transition "
+            "duration (e.g. 02:30 -> 03:30 for a one-hour jump)."
+        ),
+    )
+    fold: Literal["both", "earlier", "later"] = Field(
+        default="both",
+        description=(
+            "Which pass of a repeated (fall-back) wall time to keep: 'both' "
+            "returns two occurrences (fold 0 and 1), 'earlier' keeps the "
+            "first (fold 0), 'later' keeps the second (fold 1)."
+        ),
+    )
 
 
 class OccurrenceRequest(BaseModel):
@@ -57,6 +84,14 @@ class OccurrenceRequest(BaseModel):
     rdate: list[str] = Field(
         default_factory=list,
         description="Additional local wall times to add (RFC 5545 RDATE semantics).",
+    )
+    dst_policy: DstPolicy = Field(
+        default_factory=DstPolicy,
+        description=(
+            "Optional DST gap/fold policy applied to DTSTART, RRULE and RDATE. "
+            "Defaults to {\"gap\": \"skip\", \"fold\": \"both\"}. EXDATE always "
+            "matches the original local wall time regardless of this policy."
+        ),
     )
 
 
